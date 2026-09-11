@@ -2729,8 +2729,8 @@ func (s *RDBLogStore) GetModelRankings(ctx context.Context, filters SearchFilter
 		if prev, ok := prevMap[key]; ok && prev.TotalRequests > 0 {
 			trend.HasPreviousPeriod = true
 			trend.RequestsTrend = pctChange(float64(prev.TotalRequests), float64(r.TotalRequests))
-			trend.TokensTrend = pctChange(float64(prev.TotalTokens), float64(r.TotalTokens.Int64))
-			trend.CostTrend = pctChange(prev.TotalCost, r.TotalCost.Float64)
+			trend.TokensTrend = metricTrend(float64(prev.TotalTokens), float64(r.TotalTokens.Int64))
+			trend.CostTrend = metricTrend(prev.TotalCost, r.TotalCost.Float64)
 			if prev.AvgLatency > 0 {
 				trend.LatencyTrend = pctChange(prev.AvgLatency, r.AvgLatency.Float64)
 			}
@@ -2853,8 +2853,8 @@ func (s *RDBLogStore) GetUserRankings(ctx context.Context, filters SearchFilters
 		if prev, ok := prevMap[r.UserID]; ok && prev.TotalRequests > 0 {
 			trend.HasPreviousPeriod = true
 			trend.RequestsTrend = pctChange(float64(prev.TotalRequests), float64(r.TotalRequests))
-			trend.TokensTrend = pctChange(float64(prev.TotalTokens), float64(r.TotalTokens.Int64))
-			trend.CostTrend = pctChange(prev.TotalCost, r.TotalCost.Float64)
+			trend.TokensTrend = metricTrend(float64(prev.TotalTokens), float64(r.TotalTokens.Int64))
+			trend.CostTrend = metricTrend(prev.TotalCost, r.TotalCost.Float64)
 		}
 
 		rankings[i] = UserRankingWithTrend{
@@ -3059,8 +3059,8 @@ func (s *RDBLogStore) GetDimensionRankings(ctx context.Context, filters SearchFi
 		if prev, exists := prevMap[r.ID]; exists && prev.TotalRequests > 0 {
 			trend.HasPreviousPeriod = true
 			trend.RequestsTrend = pctChange(float64(prev.TotalRequests), float64(r.TotalRequests))
-			trend.TokensTrend = pctChange(float64(prev.TotalTokens), float64(r.TotalTokens.Int64))
-			trend.CostTrend = pctChange(prev.TotalCost, r.TotalCost.Float64)
+			trend.TokensTrend = metricTrend(float64(prev.TotalTokens), float64(r.TotalTokens.Int64))
+			trend.CostTrend = metricTrend(prev.TotalCost, r.TotalCost.Float64)
 		}
 
 		rankings[i] = DimensionRankingWithTrend{
@@ -3083,6 +3083,19 @@ func pctChange(old, new float64) float64 {
 		return 0
 	}
 	return (new - old) / old * 100
+}
+
+// metricTrend is pctChange for a metric that can sit at zero while the row still
+// has request history - a period of cache hits or free models costs nothing. A
+// zero baseline moving to a nonzero value has no percentage change, so it is
+// reported as nil (null on the wire) rather than the 0% that reads as
+// "unchanged". Zero to zero is a genuine 0%.
+func metricTrend(old, new float64) *float64 {
+	if old == 0 && new != 0 {
+		return nil
+	}
+	change := pctChange(old, new)
+	return &change
 }
 
 // GetProviderCostHistogram returns time-bucketed cost data with provider breakdown for the given filters.
