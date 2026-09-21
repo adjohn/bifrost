@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/google/uuid"
+	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore"
 	"github.com/maximhq/bifrost/framework/configstore/tables"
 )
@@ -33,6 +36,7 @@ func describeVirtualKeyTool() Tool {
   },
   "required": ["virtual_key_id"]
 }`,
+		noLogs: true,
 		execute: func(ctx context.Context, deps *Deps, args map[string]any) (any, error) {
 			if deps.Governance == nil {
 				return nil, fmt.Errorf("virtual key detail is not available on this deployment")
@@ -160,6 +164,830 @@ func providerConfigSummary(config tables.TableVirtualKeyProviderConfig) map[stri
 	}
 	if config.RateLimit != nil {
 		out["rate_limit"] = rateLimitSummary(*config.RateLimit)
+	}
+	return out
+}
+
+func generateVirtualKeyValue() string {
+	return VirtualKeyPrefix + uuid.NewString()
+}
+
+func listLimit(args map[string]any) (int, error) {
+	return intArg(args, "limit", 10, MaxGovernanceRows)
+}
+
+func listVirtualKeysTool() Tool {
+	return Tool{
+		name:        "list_virtual_keys",
+		description: "List virtual keys (id, name, active, team/customer). Never returns the secret value. Use describe_virtual_key for budget and providers.",
+		schemaJSON: `{
+  "type": "object",
+  "properties": {
+    "search": {"type": "string"},
+    "team_id": {"type": "string"},
+    "customer_id": {"type": "string"},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 20}
+  }
+}`,
+		noLogs: true,
+		execute: func(ctx context.Context, deps *Deps, args map[string]any) (any, error) {
+			gov, err := requireGovernance(deps)
+			if err != nil {
+				return nil, err
+			}
+			limit, err := listLimit(args)
+			if err != nil {
+				return nil, err
+			}
+			search, _, err := optionalStringArg(args, "search")
+			if err != nil {
+				return nil, err
+			}
+			teamID, _, err := optionalStringArg(args, "team_id")
+			if err != nil {
+				return nil, err
+			}
+			customerID, _, err := optionalStringArg(args, "customer_id")
+			if err != nil {
+				return nil, err
+			}
+			rows, total, err := gov.GetVirtualKeysPaginated(ctx, configstore.VirtualKeyQueryParams{
+				Limit: limit, Search: search, TeamID: teamID, CustomerID: customerID,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("list virtual keys failed: %w", err)
+			}
+			out := make([]map[string]any, 0, len(rows))
+			for i := range rows {
+				item := describeVirtualKey(&rows[i])
+				delete(item, "budgets")
+				delete(item, "rate_limit")
+				delete(item, "providers")
+				out = append(out, item)
+			}
+			return map[string]any{"virtual_keys": out, "total": total, "returned": len(out)}, nil
+		},
+	}
+}
+
+func listTeamsTool() Tool {
+	return Tool{
+		name:        "list_teams",
+		description: "List teams (id, name, customer, budget summaries). Use describe_team for one team.",
+		schemaJSON: `{
+  "type": "object",
+  "properties": {
+    "search": {"type": "string"},
+    "customer_id": {"type": "string"},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 20}
+  }
+}`,
+		noLogs: true,
+		execute: func(ctx context.Context, deps *Deps, args map[string]any) (any, error) {
+			gov, err := requireGovernance(deps)
+			if err != nil {
+				return nil, err
+			}
+			limit, err := listLimit(args)
+			if err != nil {
+				return nil, err
+			}
+			search, _, err := optionalStringArg(args, "search")
+			if err != nil {
+				return nil, err
+			}
+			customerID, _, err := optionalStringArg(args, "customer_id")
+			if err != nil {
+				return nil, err
+			}
+			rows, total, err := gov.GetTeamsPaginated(ctx, configstore.TeamsQueryParams{
+				Limit: limit, Search: search, CustomerID: customerID,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("list teams failed: %w", err)
+			}
+			out := make([]map[string]any, 0, len(rows))
+			for i := range rows {
+				out = append(out, describeTeam(&rows[i]))
+			}
+			return map[string]any{"teams": out, "total": total, "returned": len(out)}, nil
+		},
+	}
+}
+
+func describeTeamTool() Tool {
+	return Tool{
+		name:        "describe_team",
+		description: "One team's budgets, rate limit and virtual-key count.",
+		schemaJSON: `{
+  "type": "object",
+  "properties": {
+    "team_id": {"type": "string"}
+  },
+  "required": ["team_id"]
+}`,
+		noLogs: true,
+		execute: func(ctx context.Context, deps *Deps, args map[string]any) (any, error) {
+			gov, err := requireGovernance(deps)
+			if err != nil {
+				return nil, err
+			}
+			id, err := stringArg(args, "team_id")
+			if err != nil {
+				return nil, err
+			}
+			team, err := gov.GetTeam(ctx, id)
+			if err != nil {
+				if errors.Is(err, configstore.ErrNotFound) {
+					return nil, fmt.Errorf("no team with id %q", id)
+				}
+				return nil, fmt.Errorf("team lookup failed: %w", err)
+			}
+			return describeTeam(team), nil
+		},
+	}
+}
+
+func listCustomersTool() Tool {
+	return Tool{
+		name:        "list_customers",
+		description: "List customers (id, name, budget summaries).",
+		schemaJSON: `{
+  "type": "object",
+  "properties": {
+    "search": {"type": "string"},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 20}
+  }
+}`,
+		noLogs: true,
+		execute: func(ctx context.Context, deps *Deps, args map[string]any) (any, error) {
+			gov, err := requireGovernance(deps)
+			if err != nil {
+				return nil, err
+			}
+			limit, err := listLimit(args)
+			if err != nil {
+				return nil, err
+			}
+			search, _, err := optionalStringArg(args, "search")
+			if err != nil {
+				return nil, err
+			}
+			rows, total, err := gov.GetCustomersPaginated(ctx, configstore.CustomersQueryParams{
+				Limit: limit, Search: search,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("list customers failed: %w", err)
+			}
+			out := make([]map[string]any, 0, len(rows))
+			for i := range rows {
+				out = append(out, describeCustomer(&rows[i]))
+			}
+			return map[string]any{"customers": out, "total": total, "returned": len(out)}, nil
+		},
+	}
+}
+
+func describeCustomerTool() Tool {
+	return Tool{
+		name:        "describe_customer",
+		description: "One customer's budgets, rate limit and virtual-key count.",
+		schemaJSON: `{
+  "type": "object",
+  "properties": {
+    "customer_id": {"type": "string"}
+  },
+  "required": ["customer_id"]
+}`,
+		noLogs: true,
+		execute: func(ctx context.Context, deps *Deps, args map[string]any) (any, error) {
+			gov, err := requireGovernance(deps)
+			if err != nil {
+				return nil, err
+			}
+			id, err := stringArg(args, "customer_id")
+			if err != nil {
+				return nil, err
+			}
+			customer, err := gov.GetCustomer(ctx, id)
+			if err != nil {
+				if errors.Is(err, configstore.ErrNotFound) {
+					return nil, fmt.Errorf("no customer with id %q", id)
+				}
+				return nil, fmt.Errorf("customer lookup failed: %w", err)
+			}
+			return describeCustomer(customer), nil
+		},
+	}
+}
+
+func listBudgetsTool() Tool {
+	return Tool{
+		name:        "list_budgets",
+		description: "List budgets (id, cap, usage, reset, owner). VK-owned budgets live on model configs and may not appear here.",
+		schemaJSON: `{
+  "type": "object",
+  "properties": {
+    "limit": {"type": "integer", "minimum": 1, "maximum": 20}
+  }
+}`,
+		noLogs: true,
+		execute: func(ctx context.Context, deps *Deps, args map[string]any) (any, error) {
+			gov, err := requireGovernance(deps)
+			if err != nil {
+				return nil, err
+			}
+			limit, err := listLimit(args)
+			if err != nil {
+				return nil, err
+			}
+			rows, err := gov.GetBudgets(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("list budgets failed: %w", err)
+			}
+			if len(rows) > limit {
+				rows = rows[:limit]
+			}
+			out := make([]map[string]any, 0, len(rows))
+			for i := range rows {
+				out = append(out, describeBudget(&rows[i]))
+			}
+			return map[string]any{"budgets": out, "returned": len(out)}, nil
+		},
+	}
+}
+
+func describeBudgetTool() Tool {
+	return Tool{
+		name:        "describe_budget",
+		description: "One budget: cap, current usage, reset window and owner.",
+		schemaJSON: `{
+  "type": "object",
+  "properties": {
+    "budget_id": {"type": "string"}
+  },
+  "required": ["budget_id"]
+}`,
+		noLogs: true,
+		execute: func(ctx context.Context, deps *Deps, args map[string]any) (any, error) {
+			gov, err := requireGovernance(deps)
+			if err != nil {
+				return nil, err
+			}
+			id, err := stringArg(args, "budget_id")
+			if err != nil {
+				return nil, err
+			}
+			budget, err := gov.GetBudget(ctx, id)
+			if err != nil {
+				if errors.Is(err, configstore.ErrNotFound) {
+					return nil, fmt.Errorf("no budget with id %q", id)
+				}
+				return nil, fmt.Errorf("budget lookup failed: %w", err)
+			}
+			return describeBudget(budget), nil
+		},
+	}
+}
+
+func createVirtualKeyTool() Tool {
+	return Tool{
+		name:        "create_virtual_key",
+		description: "Create a virtual key. Returns the sk-bf- secret once; store it. Later get/list calls never include it. Attach to a team or a customer, not both.",
+		schemaJSON: `{
+  "type": "object",
+  "properties": {
+    "name": {"type": "string", "minLength": 1},
+    "description": {"type": "string"},
+    "team_id": {"type": "string"},
+    "customer_id": {"type": "string"},
+    "allow_all_providers": {"type": "boolean", "description": "Defaults to true so the key can reach every configured provider."}
+  },
+  "required": ["name"]
+}`,
+		noLogs:   true,
+		mutating: true,
+		execute: func(ctx context.Context, deps *Deps, args map[string]any) (any, error) {
+			gov, err := requireGovernance(deps)
+			if err != nil {
+				return nil, err
+			}
+			name, err := stringArg(args, "name")
+			if err != nil {
+				return nil, err
+			}
+			description, _, err := optionalStringArg(args, "description")
+			if err != nil {
+				return nil, err
+			}
+			teamID, hasTeam, err := optionalStringArg(args, "team_id")
+			if err != nil {
+				return nil, err
+			}
+			customerID, hasCustomer, err := optionalStringArg(args, "customer_id")
+			if err != nil {
+				return nil, err
+			}
+			if hasTeam && hasCustomer {
+				return nil, fmt.Errorf("virtual key cannot be attached to both team and customer")
+			}
+			allowAll := true
+			if _, present := args["allow_all_providers"]; present {
+				allowAll, err = boolArg(args, "allow_all_providers")
+				if err != nil {
+					return nil, err
+				}
+			}
+			active := true
+			secret := generateVirtualKeyValue()
+			vk := &tables.TableVirtualKey{
+				ID:                uuid.NewString(),
+				Name:              name,
+				Description:       description,
+				Value:             *schemas.NewSecretVar(secret),
+				IsActive:          &active,
+				AllowAllProviders: allowAll,
+			}
+			if hasTeam {
+				vk.TeamID = &teamID
+			}
+			if hasCustomer {
+				vk.CustomerID = &customerID
+			}
+			if err := gov.CreateVirtualKey(ctx, vk); err != nil {
+				if errors.Is(err, configstore.ErrAlreadyExists) {
+					return nil, fmt.Errorf("a virtual key named %q already exists", name)
+				}
+				return nil, fmt.Errorf("create virtual key failed: %w", err)
+			}
+			if reloader := requireReloader(deps); reloader != nil {
+				if reloaded, err := reloader.ReloadVirtualKey(ctx, vk.ID); err == nil && reloaded != nil {
+					vk = reloaded
+				}
+			}
+			out := describeVirtualKey(vk)
+			out["value"] = secret
+			out["note"] = "this is the only time the secret is returned; store it now"
+			return out, nil
+		},
+	}
+}
+
+func updateVirtualKeyTool() Tool {
+	return Tool{
+		name:        "update_virtual_key",
+		description: "Update a virtual key's name, description, active flag, or team/customer. Does not rotate the secret.",
+		schemaJSON: `{
+  "type": "object",
+  "properties": {
+    "virtual_key_id": {"type": "string"},
+    "name": {"type": "string"},
+    "description": {"type": "string"},
+    "is_active": {"type": "boolean"},
+    "team_id": {"type": "string"},
+    "customer_id": {"type": "string"},
+    "allow_all_providers": {"type": "boolean"}
+  },
+  "required": ["virtual_key_id"]
+}`,
+		noLogs:   true,
+		mutating: true,
+		execute: func(ctx context.Context, deps *Deps, args map[string]any) (any, error) {
+			gov, err := requireGovernance(deps)
+			if err != nil {
+				return nil, err
+			}
+			id, err := stringArg(args, "virtual_key_id")
+			if err != nil {
+				return nil, err
+			}
+			vk, err := gov.GetVirtualKey(ctx, id)
+			if err != nil {
+				if errors.Is(err, configstore.ErrNotFound) {
+					return nil, fmt.Errorf("no virtual key with id %q", id)
+				}
+				return nil, fmt.Errorf("virtual key lookup failed: %w", err)
+			}
+			if name, ok, err := optionalStringArg(args, "name"); err != nil {
+				return nil, err
+			} else if ok {
+				vk.Name = name
+			}
+			if description, ok, err := optionalStringArg(args, "description"); err != nil {
+				return nil, err
+			} else if ok {
+				vk.Description = description
+			}
+			if _, present := args["is_active"]; present {
+				active, err := boolArg(args, "is_active")
+				if err != nil {
+					return nil, err
+				}
+				vk.IsActive = &active
+			}
+			if _, present := args["allow_all_providers"]; present {
+				allowAll, err := boolArg(args, "allow_all_providers")
+				if err != nil {
+					return nil, err
+				}
+				vk.AllowAllProviders = allowAll
+			}
+			teamID, hasTeam, err := optionalStringArg(args, "team_id")
+			if err != nil {
+				return nil, err
+			}
+			customerID, hasCustomer, err := optionalStringArg(args, "customer_id")
+			if err != nil {
+				return nil, err
+			}
+			if hasTeam && hasCustomer {
+				return nil, fmt.Errorf("virtual key cannot be attached to both team and customer")
+			}
+			if hasTeam {
+				vk.TeamID = &teamID
+				vk.CustomerID = nil
+			}
+			if hasCustomer {
+				vk.CustomerID = &customerID
+				vk.TeamID = nil
+			}
+			if err := gov.UpdateVirtualKey(ctx, vk); err != nil {
+				return nil, fmt.Errorf("update virtual key failed: %w", err)
+			}
+			if reloader := requireReloader(deps); reloader != nil {
+				if reloaded, err := reloader.ReloadVirtualKey(ctx, vk.ID); err == nil && reloaded != nil {
+					vk = reloaded
+				}
+			}
+			return describeVirtualKey(vk), nil
+		},
+	}
+}
+
+func deactivateVirtualKeyTool() Tool {
+	return Tool{
+		name:        "deactivate_virtual_key",
+		description: "Deactivate a virtual key so it stops authenticating. Does not delete the row or rotate the secret.",
+		schemaJSON: `{
+  "type": "object",
+  "properties": {
+    "virtual_key_id": {"type": "string"}
+  },
+  "required": ["virtual_key_id"]
+}`,
+		noLogs:   true,
+		mutating: true,
+		execute: func(ctx context.Context, deps *Deps, args map[string]any) (any, error) {
+			args["is_active"] = false
+			return updateVirtualKeyTool().execute(ctx, deps, args)
+		},
+	}
+}
+
+func rotateVirtualKeyTool() Tool {
+	return Tool{
+		name:        "rotate_virtual_key",
+		description: "Issue a new sk-bf- secret for a virtual key. Returns the new value once. The previous value stays valid for vk_rotation_cooldown (or stops immediately when that is 0).",
+		schemaJSON: `{
+  "type": "object",
+  "properties": {
+    "virtual_key_id": {"type": "string"}
+  },
+  "required": ["virtual_key_id"]
+}`,
+		noLogs:   true,
+		mutating: true,
+		execute: func(ctx context.Context, deps *Deps, args map[string]any) (any, error) {
+			gov, err := requireGovernance(deps)
+			if err != nil {
+				return nil, err
+			}
+			id, err := stringArg(args, "virtual_key_id")
+			if err != nil {
+				return nil, err
+			}
+			vk, err := gov.GetVirtualKey(ctx, id)
+			if err != nil {
+				if errors.Is(err, configstore.ErrNotFound) {
+					return nil, fmt.Errorf("no virtual key with id %q", id)
+				}
+				return nil, fmt.Errorf("virtual key lookup failed: %w", err)
+			}
+			oldValue := vk.Value.GetValue()
+			secret := generateVirtualKeyValue()
+			if secret == oldValue {
+				return nil, fmt.Errorf("generated virtual key matched existing value")
+			}
+			vk.Value = *schemas.NewSecretVar(secret)
+			now := Now()
+			vk.RotatedAt = &now
+			cooldown := time.Duration(0)
+			if cfg, err := gov.GetClientConfig(ctx); err == nil && cfg != nil {
+				cooldown = cfg.VKRotationCooldown.D()
+			}
+			if cooldown > 0 {
+				vk.PreviousValue = *schemas.NewSecretVar(oldValue)
+				expires := now.Add(cooldown)
+				vk.PreviousValueExpiresAt = &expires
+			} else {
+				vk.ClearPreviousValue()
+			}
+			if err := gov.UpdateVirtualKey(ctx, vk); err != nil {
+				return nil, fmt.Errorf("rotate virtual key failed: %w", err)
+			}
+			if reloader := requireReloader(deps); reloader != nil {
+				if reloaded, err := reloader.ReloadVirtualKey(ctx, vk.ID); err == nil && reloaded != nil {
+					vk = reloaded
+				}
+			}
+			out := describeVirtualKey(vk)
+			out["value"] = secret
+			out["note"] = "this is the only time the new secret is returned; store it now"
+			if vk.PreviousValueExpiresAt != nil {
+				out["previous_value_expires_at"] = *vk.PreviousValueExpiresAt
+			}
+			return out, nil
+		},
+	}
+}
+
+func createTeamTool() Tool {
+	return Tool{
+		name:        "create_team",
+		description: "Create a team. Optionally attach it to a customer.",
+		schemaJSON: `{
+  "type": "object",
+  "properties": {
+    "name": {"type": "string", "minLength": 1},
+    "customer_id": {"type": "string"}
+  },
+  "required": ["name"]
+}`,
+		noLogs:   true,
+		mutating: true,
+		execute: func(ctx context.Context, deps *Deps, args map[string]any) (any, error) {
+			gov, err := requireGovernance(deps)
+			if err != nil {
+				return nil, err
+			}
+			name, err := stringArg(args, "name")
+			if err != nil {
+				return nil, err
+			}
+			customerID, hasCustomer, err := optionalStringArg(args, "customer_id")
+			if err != nil {
+				return nil, err
+			}
+			team := &tables.TableTeam{ID: uuid.NewString(), Name: name}
+			if hasCustomer {
+				team.CustomerID = &customerID
+			}
+			if err := gov.CreateTeam(ctx, team); err != nil {
+				if errors.Is(err, configstore.ErrAlreadyExists) {
+					return nil, fmt.Errorf("a team named %q already exists", name)
+				}
+				return nil, fmt.Errorf("create team failed: %w", err)
+			}
+			if reloader := requireReloader(deps); reloader != nil {
+				if reloaded, err := reloader.ReloadTeam(ctx, team.ID); err == nil && reloaded != nil {
+					team = reloaded
+				}
+			}
+			return describeTeam(team), nil
+		},
+	}
+}
+
+func createCustomerTool() Tool {
+	return Tool{
+		name:        "create_customer",
+		description: "Create a customer.",
+		schemaJSON: `{
+  "type": "object",
+  "properties": {
+    "name": {"type": "string", "minLength": 1}
+  },
+  "required": ["name"]
+}`,
+		noLogs:   true,
+		mutating: true,
+		execute: func(ctx context.Context, deps *Deps, args map[string]any) (any, error) {
+			gov, err := requireGovernance(deps)
+			if err != nil {
+				return nil, err
+			}
+			name, err := stringArg(args, "name")
+			if err != nil {
+				return nil, err
+			}
+			customer := &tables.TableCustomer{ID: uuid.NewString(), Name: name}
+			if err := gov.CreateCustomer(ctx, customer); err != nil {
+				if errors.Is(err, configstore.ErrAlreadyExists) {
+					return nil, fmt.Errorf("a customer named %q already exists", name)
+				}
+				return nil, fmt.Errorf("create customer failed: %w", err)
+			}
+			if reloader := requireReloader(deps); reloader != nil {
+				if reloaded, err := reloader.ReloadCustomer(ctx, customer.ID); err == nil && reloaded != nil {
+					customer = reloaded
+				}
+			}
+			return describeCustomer(customer), nil
+		},
+	}
+}
+
+func createBudgetTool() Tool {
+	return Tool{
+		name:        "create_budget",
+		description: "Create a budget on a team or a customer. Virtual-key budgets live on model configs and are not created here. reset_duration uses forms like 1d, 1w, 1M.",
+		schemaJSON: `{
+  "type": "object",
+  "properties": {
+    "max_limit": {"type": "number", "minimum": 0},
+    "reset_duration": {"type": "string", "minLength": 1},
+    "team_id": {"type": "string"},
+    "customer_id": {"type": "string"}
+  },
+  "required": ["max_limit", "reset_duration"]
+}`,
+		noLogs:   true,
+		mutating: true,
+		execute: func(ctx context.Context, deps *Deps, args map[string]any) (any, error) {
+			gov, err := requireGovernance(deps)
+			if err != nil {
+				return nil, err
+			}
+			maxLimit, err := floatArg(args, "max_limit")
+			if err != nil {
+				return nil, err
+			}
+			if maxLimit < 0 {
+				return nil, fmt.Errorf("max_limit cannot be negative")
+			}
+			reset, err := stringArg(args, "reset_duration")
+			if err != nil {
+				return nil, err
+			}
+			if d, err := tables.ParseDuration(reset); err != nil || d <= 0 {
+				return nil, fmt.Errorf("invalid reset_duration %q (use forms like 1d, 1w, 1M)", reset)
+			}
+			teamID, hasTeam, err := optionalStringArg(args, "team_id")
+			if err != nil {
+				return nil, err
+			}
+			customerID, hasCustomer, err := optionalStringArg(args, "customer_id")
+			if err != nil {
+				return nil, err
+			}
+			if hasTeam == hasCustomer {
+				return nil, fmt.Errorf("budget must belong to exactly one of team_id or customer_id")
+			}
+			budget := &tables.TableBudget{
+				ID:            uuid.NewString(),
+				MaxLimit:      maxLimit,
+				ResetDuration: reset,
+				LastReset:     Now(),
+			}
+			if hasTeam {
+				budget.TeamID = &teamID
+			} else {
+				budget.CustomerID = &customerID
+			}
+			if err := gov.CreateBudget(ctx, budget); err != nil {
+				return nil, fmt.Errorf("create budget failed: %w", err)
+			}
+			if reloader := requireReloader(deps); reloader != nil {
+				if hasTeam {
+					_, _ = reloader.ReloadTeam(ctx, teamID)
+				} else {
+					_, _ = reloader.ReloadCustomer(ctx, customerID)
+				}
+			}
+			return describeBudget(budget), nil
+		},
+	}
+}
+
+func updateBudgetTool() Tool {
+	return Tool{
+		name:        "update_budget",
+		description: "Change a budget's cap or reset window. Does not reset current usage.",
+		schemaJSON: `{
+  "type": "object",
+  "properties": {
+    "budget_id": {"type": "string"},
+    "max_limit": {"type": "number", "minimum": 0},
+    "reset_duration": {"type": "string"}
+  },
+  "required": ["budget_id"]
+}`,
+		noLogs:   true,
+		mutating: true,
+		execute: func(ctx context.Context, deps *Deps, args map[string]any) (any, error) {
+			gov, err := requireGovernance(deps)
+			if err != nil {
+				return nil, err
+			}
+			id, err := stringArg(args, "budget_id")
+			if err != nil {
+				return nil, err
+			}
+			budget, err := gov.GetBudget(ctx, id)
+			if err != nil {
+				if errors.Is(err, configstore.ErrNotFound) {
+					return nil, fmt.Errorf("no budget with id %q", id)
+				}
+				return nil, fmt.Errorf("budget lookup failed: %w", err)
+			}
+			if _, present := args["max_limit"]; present {
+				maxLimit, err := floatArg(args, "max_limit")
+				if err != nil {
+					return nil, err
+				}
+				if maxLimit < 0 {
+					return nil, fmt.Errorf("max_limit cannot be negative")
+				}
+				budget.MaxLimit = maxLimit
+			}
+			if reset, ok, err := optionalStringArg(args, "reset_duration"); err != nil {
+				return nil, err
+			} else if ok {
+				if d, err := tables.ParseDuration(reset); err != nil || d <= 0 {
+					return nil, fmt.Errorf("invalid reset_duration %q", reset)
+				}
+				budget.ResetDuration = reset
+			}
+			if err := gov.UpdateBudget(ctx, budget); err != nil {
+				return nil, fmt.Errorf("update budget failed: %w", err)
+			}
+			if reloader := requireReloader(deps); reloader != nil {
+				if budget.TeamID != nil {
+					_, _ = reloader.ReloadTeam(ctx, *budget.TeamID)
+				}
+				if budget.CustomerID != nil {
+					_, _ = reloader.ReloadCustomer(ctx, *budget.CustomerID)
+				}
+				if budget.VirtualKeyID != nil {
+					_, _ = reloader.ReloadVirtualKey(ctx, *budget.VirtualKeyID)
+				}
+			}
+			return describeBudget(budget), nil
+		},
+	}
+}
+
+func describeTeam(team *tables.TableTeam) map[string]any {
+	out := map[string]any{
+		"id":                team.ID,
+		"name":              team.Name,
+		"virtual_key_count": team.VirtualKeyCount,
+	}
+	if team.CustomerID != nil {
+		out["customer_id"] = *team.CustomerID
+	}
+	if len(team.Budgets) > 0 {
+		budgets := make([]map[string]any, len(team.Budgets))
+		for i, budget := range team.Budgets {
+			budgets[i] = budgetSummary(budget)
+		}
+		out["budgets"] = budgets
+	}
+	if team.RateLimit != nil {
+		out["rate_limit"] = rateLimitSummary(*team.RateLimit)
+	}
+	return out
+}
+
+func describeCustomer(customer *tables.TableCustomer) map[string]any {
+	out := map[string]any{
+		"id":                customer.ID,
+		"name":              customer.Name,
+		"virtual_key_count": customer.VirtualKeyCount,
+	}
+	if len(customer.Budgets) > 0 {
+		budgets := make([]map[string]any, len(customer.Budgets))
+		for i, budget := range customer.Budgets {
+			budgets[i] = budgetSummary(budget)
+		}
+		out["budgets"] = budgets
+	}
+	if customer.RateLimit != nil {
+		out["rate_limit"] = rateLimitSummary(*customer.RateLimit)
+	}
+	return out
+}
+
+func describeBudget(budget *tables.TableBudget) map[string]any {
+	out := budgetSummary(*budget)
+	if budget.TeamID != nil {
+		out["team_id"] = *budget.TeamID
+	}
+	if budget.CustomerID != nil {
+		out["customer_id"] = *budget.CustomerID
+	}
+	if budget.VirtualKeyID != nil {
+		out["virtual_key_id"] = *budget.VirtualKeyID
 	}
 	return out
 }

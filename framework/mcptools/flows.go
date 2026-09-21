@@ -65,6 +65,7 @@ func semanticSearchLogsTool() Tool {
   },
   "required": ["query", "filters"]
 }`,
+		noLogs: true,
 		execute: func(ctx context.Context, deps *Deps, args map[string]any) (any, error) {
 			query, _ := args["query"].(string)
 			if deps.Semantic == nil {

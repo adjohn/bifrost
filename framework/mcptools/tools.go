@@ -1,18 +1,24 @@
-// Package mcptools hosts the read-only log/metrics/governance query tools on
+// Package mcptools hosts the log, metrics, governance and catalog tools on
 // Bifrost's own MCP server, so any virtual-key-authenticated MCP client - not
 // just Warp's dashboard agent - can reach them.
 //
 // Three rules hold for every tool here:
 //
-//  1. Read-only. No executor calls a write method, and Deps exposes nothing
-//     that could.
-//  2. Bounded. Every result passes through boundToolResult before it reaches
+//  1. Bounded. Every result passes through boundToolResult before it reaches
 //     a caller. One unbounded log query would otherwise put megabytes of
 //     prompt bodies into a model's context window.
-//  3. Scope-carrying. Executors take the caller's context and hand it straight
+//  2. Scope-carrying. Executors take the caller's context and hand it straight
 //     to the store, which applies the queryscope row filter. Losing that
 //     context means every query silently returns every row in the
 //     deployment, so it is never replaced with context.Background().
+//  3. No key material on get/list. Secrets are returned only from
+//     create_virtual_key and rotate_virtual_key, once. Provider-key values
+//     go in and never come out.
+//
+// Writes persist through GovernanceReader and then reload the in-memory
+// cache (GovernanceReloader / MCPRuntime / ProviderRuntime). Warp's
+// allowlist stays the original read-only subset; mutating tools live on
+// this server only.
 //
 // One Deps value is shared across every concurrent caller, so nothing
 // caller-specific lives on it: each handler resolves the caller's default
@@ -34,7 +40,10 @@ import (
 	"unicode/utf8"
 
 	"github.com/bytedance/sonic"
+	"github.com/maximhq/bifrost/framework/configstore"
+	"github.com/maximhq/bifrost/framework/featureflags"
 	"github.com/maximhq/bifrost/framework/logstore"
+	"github.com/maximhq/bifrost/framework/modelcatalog"
 )
 
 // Bounding constants. The context-window and result-size concerns they protect
@@ -74,6 +83,15 @@ const (
 
 	// DefaultLookback is the window used when the caller names no time range.
 	DefaultLookback = 24 * time.Hour
+
+	// MaxGovernanceRows caps list_virtual_keys / list_teams / list_customers
+	// and the other catalog lists.
+	MaxGovernanceRows = 20
+
+	// VirtualKeyPrefix is the public prefix of every generated virtual-key
+	// secret. Duplicated from plugins/governance because this package cannot
+	// import it.
+	VirtualKeyPrefix = "sk-bf-"
 )
 
 // Now is a package-level seam so tests can pin "now" and assert on the windows
@@ -90,9 +108,36 @@ type Deps struct {
 	// available. semantic_search_logs is the only tool that reaches it.
 	Semantic SemanticSearcher
 	// Governance is nil on a deployment whose config store does not implement
-	// GovernanceReader. describe_virtual_key is the only tool that reaches it,
-	// and reports itself unavailable rather than panicking on a nil pointer.
+	// GovernanceReader. Catalog and write tools report themselves unavailable
+	// rather than panicking on a nil pointer.
 	Governance GovernanceReader
+	// Reloader refreshes the in-memory governance cache after a write. Nil
+	// means the row is stored but inference may not see it until restart.
+	Reloader GovernanceReloader
+	// MCPRuntime dials or drops an upstream MCP client in this process.
+	MCPRuntime MCPRuntime
+	// ProviderRuntime adds providers and keys to the live process.
+	ProviderRuntime ProviderRuntime
+	// PluginRuntime reloads a plugin after persist. Nil means stored but not loaded.
+	PluginRuntime PluginRuntime
+	// ModelsRuntime re-runs list-models discovery. Nil means refresh is unavailable.
+	ModelsRuntime ModelsRuntime
+	// ModelCatalog backs describe_model. Nil means the catalog is not loaded.
+	ModelCatalog *modelcatalog.ModelCatalog
+	// FeatureFlags is the in-memory flag store. Nil falls back to persisted overrides.
+	FeatureFlags *featureflags.Store
+	// Warp is the singleton Warp config row. Nil means Warp has never been configured
+	// and get/update report themselves unavailable.
+	Warp configstore.WarpStore
+
+	// Version is the gateway build string get_version returns.
+	Version string
+	// DisableDBPings skips store pings from get_health, matching the HTTP
+	// /health flag.
+	DisableDBPings bool
+	ConfigPing     Pinger
+	LogsPing       Pinger
+	VectorPing     Pinger
 }
 
 // Tool pairs a model-facing declaration with its executor. execute takes ctx
@@ -106,6 +151,12 @@ type Tool struct {
 	schemaJSON  string
 	description string
 	execute     func(ctx context.Context, deps *Deps, args map[string]any) (any, error)
+	// noLogs is true when the tool never touches Deps.LogManager, so it stays
+	// available on a deployment with logging disabled.
+	noLogs bool
+	// mutating is true when the tool writes. The MCP declaration then drops
+	// ReadOnlyHint so a client can confirm side effects.
+	mutating bool
 }
 
 // argumentNames lists the arguments a tool takes, read off the schema the model
@@ -657,6 +708,126 @@ func stringArg(args map[string]any, key string) (string, error) {
 	return text, nil
 }
 
+// optionalStringArg reads a string that may be omitted.
+func optionalStringArg(args map[string]any, key string) (string, bool, error) {
+	value, present := args[key]
+	if !present || value == nil {
+		return "", false, nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", false, fmt.Errorf("%s must be a string, got %T", key, value)
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "", false, fmt.Errorf("%s must not be empty", key)
+	}
+	return text, true, nil
+}
+
+// optionalBoolArg reads a boolean only when the caller sent it.
+func optionalBoolArg(args map[string]any, key string) (*bool, error) {
+	value, present := args[key]
+	if !present || value == nil {
+		return nil, nil
+	}
+	flag, ok := value.(bool)
+	if !ok {
+		return nil, fmt.Errorf("%s must be a boolean, got %T", key, value)
+	}
+	return &flag, nil
+}
+
+// optionalInt64Arg reads a whole number only when the caller sent it.
+func optionalInt64Arg(args map[string]any, key string) (*int64, error) {
+	value, present := args[key]
+	if !present || value == nil {
+		return nil, nil
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return nil, fmt.Errorf("%s must be a number, got %T", key, value)
+	}
+	if number != math.Trunc(number) {
+		return nil, fmt.Errorf("%s must be a whole number, got %v", key, value)
+	}
+	n := int64(number)
+	return &n, nil
+}
+
+// optionalIntArg reads a whole number only when the caller sent it.
+func optionalIntArg(args map[string]any, key string) (*int, error) {
+	value, present := args[key]
+	if !present || value == nil {
+		return nil, nil
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return nil, fmt.Errorf("%s must be a number, got %T", key, value)
+	}
+	if number != math.Trunc(number) {
+		return nil, fmt.Errorf("%s must be a whole number, got %v", key, value)
+	}
+	n := int(number)
+	return &n, nil
+}
+
+// optionalObjectArg reads a JSON object only when the caller sent it.
+func optionalObjectArg(args map[string]any, key string) (map[string]any, bool, error) {
+	value, present := args[key]
+	if !present || value == nil {
+		return nil, false, nil
+	}
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return nil, false, fmt.Errorf("%s must be an object, got %T", key, value)
+	}
+	return obj, true, nil
+}
+
+// floatArg reads a required number.
+func floatArg(args map[string]any, key string) (float64, error) {
+	value, present := args[key]
+	if !present || value == nil {
+		return 0, fmt.Errorf("%s is required", key)
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("%s must be a number, got %T", key, value)
+	}
+	return number, nil
+}
+
+// uintArg reads a required unsigned integer (JSON numbers arrive as float64).
+func uintArg(args map[string]any, key string) (uint, error) {
+	value, present := args[key]
+	if !present || value == nil {
+		return 0, fmt.Errorf("%s is required", key)
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("%s must be a number, got %T", key, value)
+	}
+	if number != math.Trunc(number) || number < 1 {
+		return 0, fmt.Errorf("%s must be a positive whole number, got %v", key, value)
+	}
+	return uint(number), nil
+}
+
+func requireGovernance(deps *Deps) (GovernanceReader, error) {
+	if deps == nil || deps.Governance == nil {
+		return nil, fmt.Errorf("governance is not available on this deployment")
+	}
+	return deps.Governance, nil
+}
+
+func requireReloader(deps *Deps) GovernanceReloader {
+	if deps == nil {
+		return nil
+	}
+	return deps.Reloader
+}
+
 // boolArg reads an optional boolean flag.
 //
 // A present non-boolean used to read as false, so a malformed include_content
@@ -952,6 +1123,93 @@ func buildTools() []Tool {
 		queryModelsTool(),
 		describeFilterSpaceTool(),
 		describeVirtualKeyTool(),
+
+		queryMCPLogsTool(),
+		countMCPLogsTool(),
+		getMCPLogDetailTool(),
+		queryMCPMetricsTool(),
+		queryMCPUsageByTool(),
+		getSessionTool(),
+		getSessionSummaryTool(),
+		getDroppedRequestsTool(),
+
+		listVirtualKeysTool(),
+		listTeamsTool(),
+		describeTeamTool(),
+		listCustomersTool(),
+		describeCustomerTool(),
+		listBudgetsTool(),
+		describeBudgetTool(),
+		createVirtualKeyTool(),
+		updateVirtualKeyTool(),
+		deactivateVirtualKeyTool(),
+		rotateVirtualKeyTool(),
+		createTeamTool(),
+		createCustomerTool(),
+		createBudgetTool(),
+		updateBudgetTool(),
+
+		getHealthTool(),
+		getVersionTool(),
+
+		listProvidersTool(),
+		addProviderTool(),
+		updateProviderTool(),
+		listProviderKeysTool(),
+		createProviderKeyTool(),
+		updateProviderKeyTool(),
+
+		listMCPClientsTool(),
+		addMCPClientTool(),
+		updateMCPClientTool(),
+		reconnectMCPClientTool(),
+		listMCPClientToolsTool(),
+		listMCPAuthSessionsTool(),
+		listVirtualMCPsTool(),
+		describeVirtualMCPTool(),
+		createVirtualMCPTool(),
+		updateVirtualMCPTool(),
+		attachVirtualMCPTool(),
+		detachVirtualMCPTool(),
+
+		listRoutingRulesTool(),
+		describeRoutingRuleTool(),
+		createRoutingRuleTool(),
+		updateRoutingRuleTool(),
+
+		listRateLimitsTool(),
+		describeRateLimitTool(),
+		createRateLimitTool(),
+		updateRateLimitTool(),
+
+		listModelConfigsTool(),
+		describeModelConfigTool(),
+		createModelConfigTool(),
+		updateModelConfigTool(),
+
+		describeModelTool(),
+		refreshProviderModelsTool(),
+
+		listPluginsTool(),
+		describePluginTool(),
+		createPluginTool(),
+		updatePluginTool(),
+
+		listPricingOverridesTool(),
+		describePricingOverrideTool(),
+		createPricingOverrideTool(),
+		updatePricingOverrideTool(),
+
+		listWebhooksTool(),
+		describeWebhookTool(),
+		createWebhookTool(),
+		updateWebhookTool(),
+
+		listFeatureFlagsTool(),
+		updateFeatureFlagTool(),
+
+		getWarpConfigTool(),
+		updateWarpConfigTool(),
 	}
 }
 

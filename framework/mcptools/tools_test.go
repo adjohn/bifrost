@@ -3,8 +3,13 @@ package mcptools
 import (
 	"context"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"math"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -130,6 +135,20 @@ type fakeLogReader struct {
 	// behind distinct ids. Unset behaves like a real store asked for a row that
 	// does not exist, rather than panicking through the embedded nil stub.
 	getLogFunc func(ctx context.Context, id string) (*logstore.Log, error)
+
+	sessionLogs     *logstore.SessionDetailResult
+	sessionSummary  *logstore.SessionSummaryResult
+	droppedRequests int64
+	mcpSearchResult *logstore.MCPToolLogSearchResult
+	// mcpSearchFilters and sessionIDSeen record what the tool asked the store
+	// for, so a test can check the call reached it with the caller's input.
+	mcpSearchFilters *logstore.MCPToolLogSearchFilters
+	sessionIDSeen    string
+	mcpStats         *logstore.MCPToolLogStats
+	mcpLog           *logstore.MCPToolLog
+	mcpHistogram     *logstore.MCPHistogramResult
+	mcpCostHistogram *logstore.MCPCostHistogramResult
+	mcpTopTools      *logstore.MCPTopToolsResult
 }
 
 func (f *fakeLogReader) GetLog(ctx context.Context, id string) (*logstore.Log, error) {
@@ -141,6 +160,83 @@ func (f *fakeLogReader) GetLog(ctx context.Context, id string) (*logstore.Log, e
 		return nil, fmt.Errorf("no log found with id %s", id)
 	}
 	return fn(ctx, id)
+}
+
+func (f *fakeLogReader) GetSessionLogs(ctx context.Context, sessionID string, pagination *logstore.PaginationOptions) (*logstore.SessionDetailResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sawContext = ctx
+	f.sessionIDSeen = sessionID
+	if f.sessionLogs == nil {
+		return &logstore.SessionDetailResult{SessionID: sessionID}, nil
+	}
+	return f.sessionLogs, nil
+}
+
+func (f *fakeLogReader) GetSessionSummary(ctx context.Context, sessionID string) (*logstore.SessionSummaryResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sawContext = ctx
+	if f.sessionSummary == nil {
+		return &logstore.SessionSummaryResult{SessionID: sessionID}, nil
+	}
+	return f.sessionSummary, nil
+}
+
+func (f *fakeLogReader) GetDroppedRequests(context.Context) int64 {
+	return f.droppedRequests
+}
+
+func (f *fakeLogReader) GetMCPToolLog(ctx context.Context, id string) (*logstore.MCPToolLog, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sawContext = ctx
+	if f.mcpLog == nil {
+		return nil, fmt.Errorf("no mcp log found with id %s", id)
+	}
+	return f.mcpLog, nil
+}
+
+func (f *fakeLogReader) SearchMCPToolLogs(ctx context.Context, filters *logstore.MCPToolLogSearchFilters, pagination *logstore.PaginationOptions) (*logstore.MCPToolLogSearchResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sawContext = ctx
+	f.mcpSearchFilters = filters
+	if f.mcpSearchResult != nil {
+		return f.mcpSearchResult, nil
+	}
+	return &logstore.MCPToolLogSearchResult{}, nil
+}
+
+func (f *fakeLogReader) GetMCPToolLogStats(ctx context.Context, filters *logstore.MCPToolLogSearchFilters) (*logstore.MCPToolLogStats, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sawContext = ctx
+	if f.mcpStats != nil {
+		return f.mcpStats, nil
+	}
+	return &logstore.MCPToolLogStats{}, nil
+}
+
+func (f *fakeLogReader) GetMCPHistogram(ctx context.Context, filters logstore.MCPToolLogSearchFilters, bucketSizeSeconds int64) (*logstore.MCPHistogramResult, error) {
+	if f.mcpHistogram != nil {
+		return f.mcpHistogram, nil
+	}
+	return &logstore.MCPHistogramResult{BucketSizeSeconds: bucketSizeSeconds}, nil
+}
+
+func (f *fakeLogReader) GetMCPCostHistogram(ctx context.Context, filters logstore.MCPToolLogSearchFilters, bucketSizeSeconds int64) (*logstore.MCPCostHistogramResult, error) {
+	if f.mcpCostHistogram != nil {
+		return f.mcpCostHistogram, nil
+	}
+	return &logstore.MCPCostHistogramResult{BucketSizeSeconds: bucketSizeSeconds}, nil
+}
+
+func (f *fakeLogReader) GetMCPTopTools(ctx context.Context, filters logstore.MCPToolLogSearchFilters, limit int) (*logstore.MCPTopToolsResult, error) {
+	if f.mcpTopTools != nil {
+		return f.mcpTopTools, nil
+	}
+	return &logstore.MCPTopToolsResult{}, nil
 }
 
 // enter records one more of this fake's calls starting, updating the
@@ -409,6 +505,20 @@ func runToolCtx(t *testing.T, ctx context.Context, name string, deps *Deps, args
 	return tool.execute(ctx, deps, args)
 }
 
+// runToolViaHandler calls a tool the way the MCP server does, through
+// toolHandler, so server-level refusals such as the missing log store apply.
+func runToolViaHandler(t *testing.T, name string, deps *Deps, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	tool, ok := toolByName(buildTools(), name)
+	require.True(t, ok, "tool %s should exist", name)
+	request := mcp.CallToolRequest{}
+	request.Params.Name = name
+	request.Params.Arguments = args
+	result, err := toolHandler(StaticDeps(deps), *tool)(context.Background(), request)
+	require.NoError(t, err)
+	return result
+}
+
 // toolByName looks up a tool by the name a caller used.
 func toolByName(tools []Tool, name string) (*Tool, bool) {
 	for i := range tools {
@@ -459,12 +569,16 @@ func TestServerDeclaresEveryTool(t *testing.T) {
 	listed, err := client.ListTools(ctx, mcp.ListToolsRequest{})
 	require.NoError(t, err)
 	names := make([]string, 0, len(listed.Tools))
+	byName := map[string]Tool{}
+	for _, tool := range buildTools() {
+		byName[tool.name] = tool
+	}
 	for _, tool := range listed.Tools {
 		names = append(names, tool.Name)
-		// Every tool only reads, and says so, so a client can call them
-		// without a confirmation it reserves for side effects.
+		declared, ok := byName[tool.Name]
+		require.True(t, ok, tool.Name)
 		require.NotNil(t, tool.Annotations.ReadOnlyHint, tool.Name)
-		require.True(t, *tool.Annotations.ReadOnlyHint, tool.Name)
+		require.Equal(t, !declared.mutating, *tool.Annotations.ReadOnlyHint, tool.Name)
 	}
 	want := make([]string, 0, len(buildTools()))
 	for _, tool := range buildTools() {
@@ -1882,6 +1996,11 @@ func TestUsageByDescriptionLeadsWithTheFailureBreakdown(t *testing.T) {
 // fall behind the schema again.
 func TestServerRefusesArgumentsAToolDoesNotTake(t *testing.T) {
 	for _, tool := range buildTools() {
+		if len(tool.argumentNames()) == 0 {
+			require.NoError(t, refuseUnknownArguments(tool.name, nil, map[string]any{}))
+			require.ErrorContains(t, refuseUnknownArguments(tool.name, nil, map[string]any{"unexpected": true}), tool.name)
+			continue
+		}
 		require.NotEmpty(t, tool.argumentNames(), "tool %s declares no arguments", tool.name)
 	}
 	tool, ok := toolByName(buildTools(), "query_model_performance")
@@ -1957,4 +2076,159 @@ func TestServerResolvesDepsPerCall(t *testing.T) {
 	require.True(t, call().IsError, "no log store yet")
 	current = &Deps{LogManager: &fakeLogReader{}}
 	require.False(t, call().IsError, "log store bound after the server was built")
+}
+
+// toolFacts is what the source says about one tool: its flags as declared, and
+// whether its code (directly or through package helpers) reads deps.LogManager.
+type toolFacts struct {
+	noLogs, mutating, readsLogs bool
+}
+
+// scanToolFacts parses the package's non-test sources and reports, per tool,
+// its declared flags and whether its function reaches LogManager. Reaching is
+// followed through package-level helper calls, since tools share builders.
+func scanToolFacts(t *testing.T) map[string]toolFacts {
+	t.Helper()
+	fset := token.NewFileSet()
+	packages, err := parser.ParseDir(fset, ".", func(info fs.FileInfo) bool {
+		return !strings.HasSuffix(info.Name(), "_test.go")
+	}, 0)
+	require.NoError(t, err)
+
+	funcs := map[string]*ast.FuncDecl{}
+	for _, file := range packages["mcptools"].Files {
+		for _, decl := range file.Decls {
+			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Body != nil && fn.Recv == nil {
+				funcs[fn.Name.Name] = fn
+			}
+		}
+	}
+	// Direct readers, then close over calls until nothing changes.
+	reads := map[string]bool{}
+	calls := map[string][]string{}
+	for name, fn := range funcs {
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			switch n := node.(type) {
+			case *ast.SelectorExpr:
+				if n.Sel.Name == "LogManager" {
+					reads[name] = true
+				}
+			case *ast.CallExpr:
+				if ident, ok := n.Fun.(*ast.Ident); ok {
+					if _, isFunc := funcs[ident.Name]; isFunc {
+						calls[name] = append(calls[name], ident.Name)
+					}
+				}
+			}
+			return true
+		})
+	}
+	for changed := true; changed; {
+		changed = false
+		for name, callees := range calls {
+			if reads[name] {
+				continue
+			}
+			for _, callee := range callees {
+				if reads[callee] {
+					reads[name], changed = true, true
+					break
+				}
+			}
+		}
+	}
+
+	facts := map[string]toolFacts{}
+	for name, fn := range funcs {
+		if fn.Type.Results == nil || len(fn.Type.Results.List) != 1 {
+			continue
+		}
+		if ident, ok := fn.Type.Results.List[0].Type.(*ast.Ident); !ok || ident.Name != "Tool" {
+			continue
+		}
+		var lit *ast.CompositeLit
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			if c, ok := node.(*ast.CompositeLit); ok && lit == nil {
+				if ident, ok := c.Type.(*ast.Ident); ok && ident.Name == "Tool" {
+					lit = c
+					return false
+				}
+			}
+			return true
+		})
+		if lit == nil {
+			continue
+		}
+		toolName, f := "", toolFacts{readsLogs: reads[name]}
+		for _, elt := range lit.Elts {
+			kv, ok := elt.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			key, _ := kv.Key.(*ast.Ident)
+			if key == nil {
+				continue
+			}
+			switch key.Name {
+			case "name":
+				switch v := kv.Value.(type) {
+				case *ast.BasicLit:
+					toolName = strings.Trim(v.Value, `"`)
+				case *ast.Ident:
+					if v.Name == "SemanticSearchToolName" {
+						toolName = SemanticSearchToolName
+					}
+				}
+			case "noLogs":
+				f.noLogs = isTrueIdent(kv.Value)
+			case "mutating":
+				f.mutating = isTrueIdent(kv.Value)
+			}
+		}
+		require.NotEmpty(t, toolName, "%s returns a Tool whose name the scan cannot read", name)
+		facts[toolName] = f
+	}
+	return facts
+}
+
+func isTrueIdent(expr ast.Expr) bool {
+	ident, ok := expr.(*ast.Ident)
+	return ok && ident.Name == "true"
+}
+
+// noLogs must match what a tool does. Set on a tool that reads the log store,
+// it dereferences a nil reader when logging is disabled; missing on one that
+// does not, the tool is refused for no reason on such a deployment.
+func TestNoLogsMatchesLogStoreUse(t *testing.T) {
+	facts := scanToolFacts(t)
+	require.Len(t, facts, len(buildTools()), "the scan must see every tool buildTools returns")
+	for name, f := range facts {
+		if f.readsLogs {
+			require.False(t, f.noLogs, "%s reads deps.LogManager but is marked noLogs", name)
+		} else {
+			require.True(t, f.noLogs, "%s never reads deps.LogManager but is not marked noLogs, so it is refused when logging is off", name)
+		}
+	}
+}
+
+// Every tool name starts with a verb, and the verb says whether it writes. A
+// write tool left unmarked is advertised read-only, and a client may run it
+// without the confirmation it reserves for side effects. A tool whose verb is
+// in neither list fails here, so a new verb forces the decision.
+func TestMutatingMatchesToolVerb(t *testing.T) {
+	writeVerbs := []string{"create_", "update_", "delete_", "deactivate_", "rotate_", "add_", "attach_", "detach_", "reconnect_", "refresh_"}
+	readVerbs := []string{"list_", "describe_", "get_", "query_", "count_", "semantic_search_"}
+	hasPrefix := func(name string, prefixes []string) bool {
+		return slices.ContainsFunc(prefixes, func(p string) bool { return strings.HasPrefix(name, p) })
+	}
+	for _, tool := range buildTools() {
+		switch {
+		case hasPrefix(tool.name, writeVerbs):
+			require.True(t, tool.mutating, "%s changes state but is not marked mutating", tool.name)
+		case hasPrefix(tool.name, readVerbs):
+			require.False(t, tool.mutating, "%s only reads but is marked mutating", tool.name)
+		default:
+			t.Errorf("%s starts with a verb neither list names; add it to the write or read verbs", tool.name)
+		}
+	}
 }

@@ -30,8 +30,7 @@ func NewServer(deps func() *Deps) *server.MCPServer {
 	)
 	for _, tool := range buildTools() {
 		declaration := mcp.NewToolWithRawSchema(tool.name, tool.description, json.RawMessage(tool.schemaJSON))
-		// Every tool here only reads logs, metrics and governance config.
-		declaration.Annotations.ReadOnlyHint = mcp.ToBoolPtr(true)
+		declaration.Annotations.ReadOnlyHint = mcp.ToBoolPtr(!tool.mutating)
 		mcpServer.AddTool(declaration, toolHandler(deps, tool))
 	}
 	return mcpServer
@@ -42,12 +41,6 @@ func NewServer(deps func() *Deps) *server.MCPServer {
 func StaticDeps(deps *Deps) func() *Deps {
 	return func() *Deps { return deps }
 }
-
-// logFreeTools are the tools that never touch Deps.LogManager: semantic search
-// goes through its own searcher and describe_virtual_key reads governance. Both
-// report their own dependency missing. Every other tool needs the log store,
-// so a new tool is refused without one unless it is listed here.
-var logFreeTools = []string{SemanticSearchToolName, "describe_virtual_key"}
 
 // toolHandler adapts one Tool's execute closure into the mcp-go handler
 // shape, applying the same result-size bound every tool result gets
@@ -67,7 +60,7 @@ func toolHandler(deps func() *Deps, tool Tool) server.ToolHandlerFunc {
 		// Logging can be disabled, or its plugin removed at runtime, and the
 		// server stays up either way; the call is refused rather than
 		// dereferencing a reader that is not there.
-		if current.LogManager == nil && !slices.Contains(logFreeTools, tool.name) {
+		if current.LogManager == nil && !tool.noLogs {
 			return mcp.NewToolResultError(tool.name + " is unavailable: logging is not enabled on this deployment"), nil
 		}
 		result, err := tool.execute(ctx, current, request.GetArguments())
@@ -85,7 +78,15 @@ func toolHandler(deps func() *Deps, tool Tool) server.ToolHandlerFunc {
 // query_model_performance, a step at a time.
 func refuseUnknownArguments(tool string, accepted []string, args map[string]any) error {
 	if len(accepted) == 0 {
-		return nil
+		if len(args) == 0 {
+			return nil
+		}
+		unknown := make([]string, 0, len(args))
+		for name := range args {
+			unknown = append(unknown, name)
+		}
+		slices.Sort(unknown)
+		return fmt.Errorf("%s does not take %s", tool, strings.Join(unknown, ", "))
 	}
 	unknown := []string{}
 	for name := range args {

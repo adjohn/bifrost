@@ -353,13 +353,13 @@ func (s *GovernanceInMemoryStore) GetMCPClientBySlug(slug string) (string, strin
 // the client registered directly. Without a config store nothing persists and
 // the in-memory registration is all there is.
 func (s *BifrostHTTPServer) registerBifrostMCPServer(ctx context.Context) error {
-	warpService := s.WarpHandler.Service()
 	// Resolved per tool call rather than captured here: AddPlugin/RemovePlugin
 	// rebind Warp's log reader and semantic searcher at runtime, and a Deps
 	// snapshotted at boot would keep reading through whatever existed then. A
 	// nil LogReader (logging disabled) still gets a server: every tool that
-	// needs it reports itself unavailable.
-	server := mcptools.NewServer(warpService.MCPDeps)
+	// needs it reports itself unavailable. Reloader, runtimes and pingers are
+	// attached here because they live on the HTTP server, not on Warp.
+	server := mcptools.NewServer(s.bifrostMCPDeps)
 	if s.Config.MCPConfig != nil {
 		for _, existing := range s.Config.MCPConfig.ClientConfigs {
 			if existing != nil && existing.Name == warp.BifrostMCPClientName {
@@ -399,6 +399,52 @@ func (s *BifrostHTTPServer) registerBifrostMCPServer(ctx context.Context) error 
 		return fmt.Errorf("failed to register %s MCP client: %w", warp.BifrostMCPClientName, err)
 	}
 	return nil
+}
+
+// bifrostMCPDeps snapshots Warp's log/governance readers and attaches the
+// write/health dependencies that live on this HTTP server.
+func (s *BifrostHTTPServer) bifrostMCPDeps() *mcptools.Deps {
+	var deps *mcptools.Deps
+	if s.WarpHandler != nil {
+		if service := s.WarpHandler.Service(); service != nil {
+			deps = service.MCPDeps()
+		}
+	}
+	if deps == nil {
+		deps = &mcptools.Deps{}
+	}
+	deps.Reloader = s
+	deps.Version = handlers.GetVersion()
+	if s.Config != nil {
+		// Read per call, so under the config lock: settings updates write
+		// ClientConfig while tool calls are in flight.
+		s.Config.Mu.RLock()
+		if s.Config.ClientConfig != nil {
+			deps.DisableDBPings = s.Config.ClientConfig.DisableDBPingsInHealth
+		}
+		s.Config.Mu.RUnlock()
+		if s.Config.ConfigStore != nil {
+			deps.ConfigPing = s.Config.ConfigStore
+			if warpStore, ok := s.Config.ConfigStore.(configstore.WarpStore); ok {
+				deps.Warp = warpStore
+			}
+		}
+		if s.Config.LogsStore != nil {
+			deps.LogsPing = s.Config.LogsStore
+		}
+		if s.Config.VectorStore != nil {
+			deps.VectorPing = s.Config.VectorStore
+		}
+		deps.ProviderRuntime = s.Config
+		deps.ModelCatalog = s.Config.ModelCatalog
+		deps.FeatureFlags = s.Config.FeatureFlags
+	}
+	if s.Client != nil {
+		deps.MCPRuntime = s.Client
+	}
+	deps.PluginRuntime = s
+	deps.ModelsRuntime = s
+	return deps
 }
 
 // AddMCPClient adds a new MCP client to the in-memory store
@@ -2521,7 +2567,9 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
 	if s.WarpHandler != nil {
 		s.WarpHandler.Shutdown()
 	}
-	s.WarpHandler = handlers.NewWarpHandler(s.Config.ConfigStore, loggerPlugin, s.Client, s.Config.LogsStore, s.Config.VectorStore, s.SidekiqRunner, s.Config.ModelCatalog, logger, func() bool { return s.Config.FeatureFlags != nil && s.Config.FeatureFlags.IsEnabled(lib.FeatureFlagWarp) })
+	s.WarpHandler = handlers.NewWarpHandler(s.Config.ConfigStore, loggerPlugin, s.Client, s.Config.LogsStore, s.Config.VectorStore, s.SidekiqRunner, s.Config.ModelCatalog, logger, func() bool {
+		return s.Config.FeatureFlags != nil && s.Config.FeatureFlags.IsEnabled(lib.FeatureFlagWarp)
+	})
 	// Start WebSocket heartbeat
 	s.WebSocketHandler.StartHeartbeat()
 	// Adding telemetry middleware
