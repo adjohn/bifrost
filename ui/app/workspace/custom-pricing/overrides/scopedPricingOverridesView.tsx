@@ -379,10 +379,10 @@ export default function ScopedPricingOverridesView() {
 					data-testid="pricing-override-create-btn"
 					onClick={openCreateDrawer}
 					className="gap-2 sm:ml-auto"
-					aria-label="New pricing override"
+					aria-label="Add pricing override"
 				>
 					<Plus className="h-4 w-4" />
-					<span className="hidden sm:inline">New Override</span>
+					<span className="hidden sm:inline">Add Override</span>
 				</Button>
 			</div>
 
